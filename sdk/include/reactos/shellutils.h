@@ -294,6 +294,17 @@ HRESULT inline ShellDebugObjectCreator(REFIID riid, R ** ppv)
 }
 
 template<class T>
+HRESULT inline ShellObjectCreator(CComPtr<T> &objref)
+{
+    _CComObject<T> *pobj;
+    HRESULT hResult = _CComObject<T>::CreateInstance(&pobj);
+    objref = pobj; // AddRef() gets called here
+    if (FAILED(hResult))
+        return hResult;
+    return S_OK;
+}
+
+template<class T>
 HRESULT inline ShellObjectCreator(REFIID riid, void ** ppv)
 {
     _CComObject<T> *pobj;
@@ -586,21 +597,19 @@ void DumpIdList(LPCITEMIDLIST pcidl)
     DbgPrint("End IDList Dump.\n");
 }
 
-struct CCoInit
+template <HRESULT (WINAPI *InitFunc)(void*), void (WINAPI *UninitFunc)()>
+struct CCoInitBase
 {
-    CCoInit()
-    {
-        hr = CoInitialize(NULL);
-    }
-    ~CCoInit()
+    HRESULT hr;
+    CCoInitBase() : hr(InitFunc(NULL)) { }
+    ~CCoInitBase()
     {
         if (SUCCEEDED(hr))
-        {
-            CoUninitialize();
-        }
+            UninitFunc();
     }
-    HRESULT hr;
 };
+typedef CCoInitBase<CoInitialize, CoUninitialize> CCoInit;
+typedef CCoInitBase<OleInitialize, OleUninitialize> COleInit;
 
 #endif /* __cplusplus */
 
@@ -608,6 +617,12 @@ struct CCoInit
 #define S_EQUAL S_OK
 #define S_GREATERTHAN S_FALSE
 #define MAKE_COMPARE_HRESULT(x) ((x)>0 ? S_GREATERTHAN : ((x)<0 ? S_LESSTHAN : S_EQUAL))
+
+#define SEE_CMIC_COMMON_BASICFLAGS (SEE_MASK_NOASYNC | SEE_MASK_ASYNCOK | SEE_MASK_UNICODE | \
+                                    SEE_MASK_NO_CONSOLE | SEE_MASK_FLAG_NO_UI | SEE_MASK_FLAG_SEPVDM | \
+                                    SEE_MASK_FLAG_LOG_USAGE | SEE_MASK_NOZONECHECKS)
+#define SEE_CMIC_COMMON_FLAGS      (SEE_CMIC_COMMON_BASICFLAGS | SEE_MASK_HOTKEY | SEE_MASK_ICON | \
+                                    SEE_MASK_HASLINKNAME | SEE_MASK_HASTITLE)
 
 static inline BOOL ILIsSingle(LPCITEMIDLIST pidl)
 {
@@ -626,6 +641,19 @@ static inline PCUIDLIST_RELATIVE HIDA_GetPIDLItem(CIDA const* pida, SIZE_T i)
 
 
 #ifdef __cplusplus
+
+#if defined(CMIC_MASK_UNICODE) && defined(SEE_MASK_UNICODE)
+static inline bool IsUnicode(const CMINVOKECOMMANDINFOEX &ici)
+{
+    const UINT minsize = FIELD_OFFSET(CMINVOKECOMMANDINFOEX, ptInvoke);
+    return (ici.fMask & CMIC_MASK_UNICODE) && ici.cbSize >= minsize;
+}
+
+static inline bool IsUnicode(const CMINVOKECOMMANDINFO &ici)
+{
+    return IsUnicode(*(CMINVOKECOMMANDINFOEX*)&ici);
+}
+#endif // CMIC_MASK_UNICODE
 
 DECLSPEC_SELECTANY CLIPFORMAT g_cfHIDA = NULL;
 DECLSPEC_SELECTANY CLIPFORMAT g_cfShellIdListOffsets = NULL;
@@ -784,7 +812,7 @@ DataObject_SetOffset(IDataObject* pDataObject, POINT* point)
     return DataObject_SetData(pDataObject, g_cfShellIdListOffsets, point, sizeof(point[0]));
 }
 
-#endif
+#endif // __cplusplus
 
 #ifdef __cplusplus
 struct SHELL_GetSettingImpl
@@ -798,5 +826,50 @@ struct SHELL_GetSettingImpl
 #define SHELL_GetSetting(pss, ssf, field) ( SHGetSetSettings((pss), (ssf), FALSE), (pss)->field )
 #endif
 
+static inline void DumpIdListOneLine(LPCITEMIDLIST pidl)
+{
+    char buf[1024], *data, drive = 0;
+    for (UINT depth = 0, type; ; pidl = ILGetNext(pidl), ++depth)
+    {
+        if (!pidl || !pidl->mkid.cb)
+        {
+            if (!depth)
+            {
+                wsprintfA(buf, "%p [] (%s)\n", pidl, pidl ? "Empty/Desktop" : "NULL");
+                OutputDebugStringA(buf);
+            }
+            break;
+        }
+        else if (!depth)
+        {
+            wsprintfA(buf, "%p", pidl);
+            OutputDebugStringA(buf);
+        }
+        type = pidl->mkid.abID[0] & 0x7f;
+        data = (char*)&pidl->mkid.abID[0];
+        if (depth == 0 && type == 0x1f && pidl->mkid.cb == 20 && *(UINT*)(&data[2]) == 0x20D04FE0)
+        {
+            wsprintfA(buf, " [%.2x ThisPC?]", type); /* "?" because we did not check the full GUID */
+        }
+        else if (depth == 1 && type >= 0x20 && type < 0x30 && type != 0x2E && pidl->mkid.cb > 4)
+        {
+            drive = data[1];
+            wsprintfA(buf, " [%.2x %c: %ub]", type, drive, pidl->mkid.cb);
+        }
+        else if (depth >= 2 && drive && (type & 0x70) == 0x30) /* PT_FS */
+        {
+            if (type & 4)
+                wsprintfA(buf, " [%.2x FS %.256ls %ub]", type, data + 12, pidl->mkid.cb);
+            else
+                wsprintfA(buf, " [%.2x FS %.256hs %ub]", type, data + 12, pidl->mkid.cb);
+        }
+        else
+        {
+            wsprintfA(buf, " [%.2x ? %ub]", type, pidl->mkid.cb);
+        }
+        OutputDebugStringA(buf);
+    }
+    OutputDebugStringA("\n");
+}
 
 #endif /* __ROS_SHELL_UTILS_H */

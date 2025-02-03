@@ -613,6 +613,7 @@ public:
     LRESULT OnSetFocus(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled);
     LRESULT RelayMsgToShellView(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled);
     LRESULT OnSettingChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled);
+    LRESULT OnSysColorChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled);
     LRESULT OnClose(WORD wNotifyCode, WORD wID, HWND hWndCtl, BOOL &bHandled);
     LRESULT OnFolderOptions(WORD wNotifyCode, WORD wID, HWND hWndCtl, BOOL &bHandled);
     LRESULT OnMapNetworkDrive(WORD wNotifyCode, WORD wID, HWND hWndCtl, BOOL &bHandled);
@@ -664,6 +665,7 @@ public:
         MESSAGE_HANDLER(WM_DRAWITEM, RelayMsgToShellView)
         MESSAGE_HANDLER(WM_MENUSELECT, RelayMsgToShellView)
         MESSAGE_HANDLER(WM_SETTINGCHANGE, OnSettingChange)
+        MESSAGE_HANDLER(WM_SYSCOLORCHANGE, OnSysColorChange)
         COMMAND_ID_HANDLER(IDM_FILE_CLOSE, OnClose)
         COMMAND_ID_HANDLER(IDM_TOOLS_FOLDEROPTIONS, OnFolderOptions)
         COMMAND_ID_HANDLER(IDM_TOOLS_MAPNETWORKDRIVE, OnMapNetworkDrive)
@@ -1034,6 +1036,10 @@ HRESULT CShellBrowser::BrowseToPath(IShellFolder *newShellFolder,
     if (FAILED_UNEXPECTEDLY(hResult))
         return hResult;
 
+    if (FAILED_UNEXPECTEDLY(hResult = SHILClone(absolutePIDL, &absolutePIDL)))
+        return hResult;
+    CComHeapPtr<ITEMIDLIST> pidlAbsoluteClone(const_cast<LPITEMIDLIST>(absolutePIDL));
+
     // update history
     if (flags & BTP_UPDATE_CUR_HISTORY)
     {
@@ -1078,7 +1084,14 @@ HRESULT CShellBrowser::BrowseToPath(IShellFolder *newShellFolder,
 
     // update current pidl
     ILFree(fCurrentDirectoryPIDL);
-    fCurrentDirectoryPIDL = ILClone(absolutePIDL);
+    fCurrentDirectoryPIDL = pidlAbsoluteClone.Detach();
+    /* CORE-19697: CAddressEditBox::OnWinEvent(CBN_SELCHANGE) causes CAddressEditBox to
+     * call BrowseObject(pidlLastParsed). As part of our browsing we call FireNavigateComplete
+     * and this in turn causes CAddressEditBox::Invoke to ILFree(pidlLastParsed)!
+     * We then call SHBindToParent on absolutePIDL (which is really (the now invalid) pidlLastParsed) and we
+     * end up accessing invalid memory! We therefore set absolutePIDL to be our cloned PIDL here.
+     */
+    absolutePIDL = fCurrentDirectoryPIDL;
 
     // create view window
     hResult = newShellView->CreateViewWindow(saveCurrentShellView, folderSettings,
@@ -1263,11 +1276,8 @@ BOOL CShellBrowser::IsBandLoaded(const CLSID clsidBand, bool vertical, DWORD *pd
     if (FAILED_UNEXPECTEDLY(hResult))
         return FALSE;
 
-    hResult = bandSite->EnumBands(-1, &numBands);
-    if (FAILED_UNEXPECTEDLY(hResult))
-        return FALSE;
-
-    for(i = 0; i < numBands; i++)
+    numBands = bandSite->EnumBands(-1, NULL);
+    for (i = 0; i < numBands; i++)
     {
         CComPtr<IPersist> bandPersist;
 
@@ -1491,7 +1501,6 @@ LRESULT CALLBACK CShellBrowser::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             wParam = msg.wParam;
             lParam = msg.lParam;
         }
-        menuBand.Release();
     }
 
     handled = pThis->ProcessWindowMessage(hWnd, uMsg, wParam, lParam, lResult, 0);
@@ -1823,6 +1832,19 @@ void CShellBrowser::UpdateViewMenu(HMENU theMenu)
         SetMenuItemInfo(theMenu, IDM_VIEW_TOOLBARS, FALSE, &menuItemInfo);
     }
     SHCheckMenuItem(theMenu, IDM_VIEW_STATUSBAR, m_settings.fStatusBarVisible ? TRUE : FALSE);
+
+    // Check the menu items for Explorer bar
+    BOOL bSearchBand = (IsEqualCLSID(CLSID_SH_SearchBand, fCurrentVertBar) ||
+                        IsEqualCLSID(CLSID_SearchBand, fCurrentVertBar) ||
+                        IsEqualCLSID(CLSID_IE_SearchBand, fCurrentVertBar) ||
+                        IsEqualCLSID(CLSID_FileSearchBand, fCurrentVertBar));
+    BOOL bHistory = IsEqualCLSID(CLSID_SH_HistBand, fCurrentVertBar);
+    BOOL bFavorites = IsEqualCLSID(CLSID_SH_FavBand, fCurrentVertBar);
+    BOOL bFolders = IsEqualCLSID(CLSID_ExplorerBand, fCurrentVertBar);
+    SHCheckMenuItem(theMenu, IDM_EXPLORERBAR_SEARCH, bSearchBand);
+    SHCheckMenuItem(theMenu, IDM_EXPLORERBAR_HISTORY, bHistory);
+    SHCheckMenuItem(theMenu, IDM_EXPLORERBAR_FAVORITES, bFavorites);
+    SHCheckMenuItem(theMenu, IDM_EXPLORERBAR_FOLDERS, bFolders);
 }
 
 HRESULT CShellBrowser::BuildExplorerBandMenu()
@@ -3632,16 +3654,15 @@ LRESULT CShellBrowser::OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &
     // TODO: rip down everything
     {
         m_Destroyed = true; // Ignore browse requests from Explorer band TreeView during destruction
+        fCurrentShellView->UIActivate(SVUIA_DEACTIVATE);
         fToolbarProxy.Destroy();
         fCurrentShellView->DestroyViewWindow();
-        fCurrentShellView->UIActivate(SVUIA_DEACTIVATE);
 
         for (int i = 0; i < 3; i++)
         {
             CComPtr<IDockingWindow> pdw;
             CComPtr<IDeskBar> bar;
             CComPtr<IUnknown> pBarSite;
-            CComPtr<IDeskBarClient> pClient;
 
             if (fClientBars[i].clientBar == NULL)
                 continue;
@@ -3657,6 +3678,7 @@ LRESULT CShellBrowser::OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &
                 hr = bar->GetClient(&pBarSite);
                 if (SUCCEEDED(hr) && pBarSite)
                 {
+                    CComPtr<IDeskBarClient> pClient;
                     hr = pBarSite->QueryInterface(IID_PPV_ARG(IDeskBarClient, &pClient));
                     if (SUCCEEDED(hr))
                         pClient->SetDeskBarSite(NULL);
@@ -3664,7 +3686,6 @@ LRESULT CShellBrowser::OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &
             }
             pdw->CloseDW(0);
 
-            pClient = NULL;
             pBarSite = NULL;
             pdw = NULL;
             bar = NULL;
@@ -3694,7 +3715,7 @@ LRESULT CShellBrowser::OnSize(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHa
         GetEffectiveClientRect(m_hWnd, &availableBounds, excludeItems);
         for (INT x = 0; x < 3; x++)
         {
-            if (fClientBars[x].clientBar != NULL)
+            if (fClientBars[x].clientBar)
             {
                 hResult = fClientBars[x].clientBar->QueryInterface(
                     IID_PPV_ARG(IDockingWindow, &dockingWindow));
@@ -3768,6 +3789,12 @@ LRESULT CShellBrowser::RelayMsgToShellView(UINT uMsg, WPARAM wParam, LPARAM lPar
 LRESULT CShellBrowser::OnSettingChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
 {
     RefreshCabinetState();
+    SHPropagateMessage(m_hWnd, uMsg, wParam, lParam, TRUE);
+    return 0;
+}
+
+LRESULT CShellBrowser::OnSysColorChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+{
     SHPropagateMessage(m_hWnd, uMsg, wParam, lParam, TRUE);
     return 0;
 }

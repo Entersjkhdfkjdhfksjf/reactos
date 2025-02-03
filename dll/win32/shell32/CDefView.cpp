@@ -48,8 +48,9 @@ enum  {
     DEFVIEW_ARRANGESORT_MAX = DEFVIEW_ARRANGESORT_MAXENUM + 1, // Reserve one extra for the current sort-by column
     DVIDM_ARRANGESORT_LAST = FCIDM_SHVIEWLAST,
     DVIDM_ARRANGESORT_FIRST = DVIDM_ARRANGESORT_LAST - (DEFVIEW_ARRANGESORT_MAX - 1),
+    DVIDM_COMMDLG_SELECT = DVIDM_ARRANGESORT_FIRST - 1,
 
-    DVIDM_CONTEXTMENU_LAST = DVIDM_ARRANGESORT_FIRST - 1,
+    DVIDM_CONTEXTMENU_LAST = DVIDM_COMMDLG_SELECT - 1,
     // FIXME: FCIDM_SHVIEWFIRST is 0 and using that with QueryContextMenu is a
     // bad idea because it hides bugs related to the ids in ici.lpVerb.
     // CONTEXT_MENU_BASE_ID acknowledges this but failed to apply the fix everywhere.
@@ -57,7 +58,7 @@ enum  {
 };
 #undef FCIDM_SHVIEWLAST // Don't use this constant, change DVIDM_CONTEXTMENU_LAST if you need a new id.
 
-typedef struct
+struct LISTVIEW_SORT_INFO
 {
     INT8    Direction;
     bool    bLoadedFromViewState;
@@ -71,7 +72,7 @@ typedef struct
         *(UINT*)this = 0;
         ListColumn = UNSPECIFIEDCOLUMN;
     }
-} LISTVIEW_SORT_INFO, *LPLISTVIEW_SORT_INFO;
+};
 
 #define SHV_CHANGE_NOTIFY   (WM_USER + 0x1111)
 #define SHV_UPDATESTATUSBAR (WM_USER + 0x1112)
@@ -211,6 +212,11 @@ static UINT CalculateCharWidth(HWND hwnd)
     return ret;
 }
 
+static inline COLORREF GetViewColor(COLORREF Clr, UINT SysFallback)
+{
+    return Clr != CLR_INVALID ? Clr : GetSysColor(SysFallback);
+}
+
 class CDefView :
     public CWindowImpl<CDefView, CWindow, CControlWinTraits>,
     public CComObjectRootEx<CComMultiThreadModelNoCS>,
@@ -230,6 +236,7 @@ private:
     CComPtr<IShellFolderViewCB> m_pShellFolderViewCB;
     CComPtr<IShellBrowser>    m_pShellBrowser;
     CComPtr<ICommDlgBrowser>  m_pCommDlgBrowser;
+    CComPtr<IFolderFilter>    m_pFolderFilter;
     CComPtr<IShellFolderViewDual> m_pShellFolderViewDual;
     CListView                 m_ListView;
     HWND                      m_hWndParent;
@@ -335,6 +342,18 @@ public:
     HRESULT LoadViewState();
     HRESULT SaveViewState(IStream *pStream);
     void UpdateFolderViewFlags();
+
+    DWORD GetCommDlgViewFlags()
+    {
+        CComPtr<ICommDlgBrowser2> pcdb2;
+        if (m_pCommDlgBrowser && SUCCEEDED(m_pCommDlgBrowser->QueryInterface(IID_PPV_ARG(ICommDlgBrowser2, &pcdb2))))
+        {
+            DWORD flags;
+            if (SUCCEEDED(pcdb2->GetViewFlags(&flags)))
+                return flags;
+        }
+        return 0;
+    }
 
     // *** IOleWindow methods ***
     STDMETHOD(GetWindow)(HWND *lphwnd) override;
@@ -578,8 +597,8 @@ CDefView::CDefView() :
     ZeroMemory(&m_FolderSettings, sizeof(m_FolderSettings));
     ZeroMemory(&m_ptLastMousePos, sizeof(m_ptLastMousePos));
     ZeroMemory(&m_Category, sizeof(m_Category));
-    m_viewinfo_data.clrText = GetSysColor(COLOR_WINDOWTEXT);
-    m_viewinfo_data.clrTextBack = GetSysColor(COLOR_WINDOW);
+    m_viewinfo_data.clrText = CLR_INVALID;
+    m_viewinfo_data.clrTextBack = CLR_INVALID;
     m_viewinfo_data.hbmBack = NULL;
 
     m_sortInfo.Reset();
@@ -623,14 +642,16 @@ HRESULT WINAPI CDefView::Initialize(IShellFolder *shellFolder)
 HRESULT CDefView::IncludeObject(PCUITEMID_CHILD pidl)
 {
     HRESULT ret = S_OK;
-
-    if (m_pCommDlgBrowser.p != NULL)
+    if (m_pCommDlgBrowser && !(GetCommDlgViewFlags() & CDB2GVF_NOINCLUDEITEM))
     {
         TRACE("ICommDlgBrowser::IncludeObject pidl=%p\n", pidl);
         ret = m_pCommDlgBrowser->IncludeObject(this, pidl);
         TRACE("-- returns 0x%08x\n", ret);
     }
-
+    else if (m_pFolderFilter)
+    {
+        ret = m_pFolderFilter->ShouldShow(m_pSFParent, m_pidlParent, pidl);
+    }
     return ret;
 }
 
@@ -807,7 +828,9 @@ BOOL CDefView::CreateList()
     {
         dwStyle |= LVS_SHOWSELALWAYS; // MSDN says FWF_SHOWSELALWAYS is deprecated, always turn on for folders
         dwStyle |= (m_FolderSettings.fFlags & FWF_ALIGNLEFT) ? LVS_ALIGNLEFT : LVS_ALIGNTOP;
+#if 0 // FIXME: Temporarily disabled until ListView is fixed (CORE-19624, CORE-19818)
         ListExStyle |= LVS_EX_DOUBLEBUFFER;
+#endif
     }
 
     ViewMode = m_FolderSettings.ViewMode;
@@ -918,18 +941,8 @@ void CDefView::UpdateListColors()
     }
     else
     {
-        // text background color
-        COLORREF clrTextBack = m_viewinfo_data.clrTextBack;
-        m_ListView.SetTextBkColor(clrTextBack);
-
-        // text color
-        COLORREF clrText;
-        if (m_viewinfo_data.clrText != CLR_INVALID)
-            clrText = m_viewinfo_data.clrText;
-        else
-            clrText = GetSysColor(COLOR_WINDOWTEXT);
-
-        m_ListView.SetTextColor(clrText);
+        m_ListView.SetTextBkColor(GetViewColor(m_viewinfo_data.clrTextBack, COLOR_WINDOW));
+        m_ListView.SetTextColor(GetViewColor(m_viewinfo_data.clrText, COLOR_WINDOWTEXT));
 
         // Background is painted by the parent via WM_PRINTCLIENT
         m_ListView.SetExtendedListViewStyle(LVS_EX_TRANSPARENTBKGND, LVS_EX_TRANSPARENTBKGND);
@@ -1290,15 +1303,30 @@ PCUITEMID_CHILD CDefView::_PidlByItem(LVITEM& lvItem)
 
 int CDefView::LV_FindItemByPidl(PCUITEMID_CHILD pidl)
 {
-    ASSERT(m_ListView);
+    ASSERT(m_ListView && m_pSFParent);
 
     int cItems = m_ListView.GetItemCount();
-
-    for (int i = 0; i<cItems; i++)
+    LPARAM lParam = m_pSF2Parent ? SHCIDS_CANONICALONLY : 0;
+    for (int i = 0; i < cItems; i++)
     {
         PCUITEMID_CHILD currentpidl = _PidlByItem(i);
-        if (ILIsEqual(pidl, currentpidl))
-            return i;
+        HRESULT hr = m_pSFParent->CompareIDs(lParam, pidl, currentpidl);
+        if (SUCCEEDED(hr))
+        {
+            if (hr == S_EQUAL)
+                return i;
+        }
+        else
+        {
+            for (i = 0; i < cItems; i++)
+            {
+                //FIXME: ILIsEqual needs absolute pidls!
+                currentpidl = _PidlByItem(i);
+                if (ILIsEqual(pidl, currentpidl))
+                    return i;
+            }
+            break;
+        }
     }
     return -1;
 }
@@ -1457,12 +1485,15 @@ HRESULT CDefView::FillList(BOOL IsRefreshCommand)
     DWORD         dwFetched;
     HRESULT       hRes;
     HDPA          hdpa;
-    DWORD         dFlags = SHCONTF_NONFOLDERS | SHCONTF_FOLDERS;
+    DWORD         dFlags = SHCONTF_NONFOLDERS | ((m_FolderSettings.fFlags & FWF_NOSUBFOLDERS) ? 0 : SHCONTF_FOLDERS);
 
     TRACE("%p\n", this);
 
     SHELLSTATE shellstate;
     SHGetSetSettings(&shellstate, SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN, FALSE);
+    if (GetCommDlgViewFlags() & CDB2GVF_SHOWALLFILES)
+        shellstate.fShowAllObjects = shellstate.fShowSuperHidden = TRUE;
+
     if (shellstate.fShowAllObjects)
     {
         dFlags |= SHCONTF_INCLUDEHIDDEN;
@@ -1564,13 +1595,18 @@ LRESULT CDefView::OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHand
     if (!m_Destroyed)
     {
         m_Destroyed = TRUE;
+        RevokeDragDrop(m_hWnd);
+        SHChangeNotifyDeregister(m_hNotify);
+        if (m_pFileMenu)
+        {
+            IUnknown_SetSite(m_pFileMenu, NULL);
+            m_pFileMenu = NULL;
+        }
         if (m_hMenu)
         {
             DestroyMenu(m_hMenu);
             m_hMenu = NULL;
         }
-        RevokeDragDrop(m_hWnd);
-        SHChangeNotifyDeregister(m_hNotify);
         m_hNotify = NULL;
         SHFree(m_pidlParent);
         m_pidlParent = NULL;
@@ -1630,7 +1666,7 @@ LRESULT CDefView::OnPrintClient(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &b
     }
     else
     {
-        FillRect(hDC, &rc, GetSysColorBrush(COLOR_WINDOW));
+        SHFillRectClr(hDC, &rc, GetViewColor(m_viewinfo_data.clrTextBack, COLOR_WINDOW));
     }
 
     bHandled = TRUE;
@@ -1703,7 +1739,7 @@ LRESULT CDefView::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandl
     LPITEMIDLIST pidlTarget = NULL;
     LONG fEvents = 0;
     HRESULT hr = _DoFolderViewCB(SFVM_GETNOTIFY, (WPARAM)&pidlTarget, (LPARAM)&fEvents);
-    if (FAILED(hr) || (!pidlTarget && !fEvents))
+    if (FAILED(hr) || (!pidlTarget && !fEvents)) // FIXME: MSDN says both zero means no notifications
     {
         pidlTarget = m_pidlParent;
         fEvents = SHCNE_ALLEVENTS;
@@ -1745,8 +1781,6 @@ LRESULT CDefView::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandl
 
 // #### Handling of the menus ####
 
-extern "C" DWORD WINAPI SHMenuIndexFromID(HMENU hMenu, UINT uID);
-
 HRESULT CDefView::FillFileMenu()
 {
     HMENU hFileMenu = GetSubmenuByID(m_hMenu, FCIDM_MENU_FILE);
@@ -1781,11 +1815,15 @@ HRESULT CDefView::FillFileMenu()
         return hr;
 
     // TODO: filter or something
+    if (!selcount)
+    {
+        DeleteMenu(hmenu, FCIDM_SHVIEW_VIEW, MF_BYCOMMAND);
+        DeleteMenu(hmenu, FCIDM_SHVIEW_ARRANGE, MF_BYCOMMAND);
+        DeleteMenu(hmenu, FCIDM_SHVIEW_REFRESH, MF_BYCOMMAND);
+    }
 
     Shell_MergeMenus(hFileMenu, hmenu, 0, 0, 0xFFFF, MM_ADDSEPARATOR | MM_SUBMENUSHAVEIDS);
-
     ::DestroyMenu(hmenu);
-
     return S_OK;
 }
 
@@ -2019,7 +2057,7 @@ UINT CDefView::GetSelections()
 
     UINT i = 0;
     int lvIndex = -1;
-    while ((lvIndex = m_ListView.GetNextItem(lvIndex,  LVNI_SELECTED)) > -1)
+    while ((lvIndex = m_ListView.GetNextItem(lvIndex, LVNI_SELECTED)) > -1)
     {
         m_apidl[i] = _PidlByItem(lvIndex);
         i++;
@@ -2168,6 +2206,15 @@ LRESULT CDefView::OnContextMenu(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &b
     if (FAILED_UNEXPECTEDLY(hResult))
         return 0;
 
+    if (m_pCommDlgBrowser && !(GetCommDlgViewFlags() & CDB2GVF_NOSELECTVERB))
+    {
+        HMENU hMenuSource = LoadMenuW(_AtlBaseModule.GetResourceInstance(), MAKEINTRESOURCEW(IDM_DVSELECT));
+        Shell_MergeMenus(m_hContextMenu, GetSubMenu(hMenuSource, 0), 0, DVIDM_COMMDLG_SELECT, 0xffff, MM_ADDSEPARATOR | MM_DONTREMOVESEPS);
+        DestroyMenu(hMenuSource);
+        SetMenuDefaultItem(m_hContextMenu, DVIDM_COMMDLG_SELECT, MF_BYCOMMAND);
+        // TODO: ICommDlgBrowser2::GetDefaultMenuText == S_OK
+    }
+
     // There is no position requested, so try to find one
     if (lParam == ~0)
     {
@@ -2177,10 +2224,10 @@ LRESULT CDefView::OnContextMenu(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &b
         if (hFocus == m_ListView.m_hWnd || m_ListView.IsChild(hFocus))
         {
             // Is there an item focused and selected?
-            lvIndex = m_ListView.GetNextItem(-1, LVIS_SELECTED|LVIS_FOCUSED);
+            lvIndex = m_ListView.GetNextItem(-1, LVNI_SELECTED | LVNI_FOCUSED);
             // If not, find the first selected item
             if (lvIndex < 0)
-                lvIndex = m_ListView.GetNextItem(-1, LVIS_SELECTED);
+                lvIndex = m_ListView.GetNextItem(-1, LVNI_SELECTED);
         }
 
         // We got something
@@ -2201,21 +2248,25 @@ LRESULT CDefView::OnContextMenu(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &b
         m_ListView.ClientToScreen(&pt);
     }
 
+    CComPtr<ICommDlgBrowser2> pcdb2;
+    if (m_pCommDlgBrowser && SUCCEEDED(m_pCommDlgBrowser->QueryInterface(IID_PPV_ARG(ICommDlgBrowser2, &pcdb2))))
+        pcdb2->Notify(static_cast<IShellView*>(this), CDB2N_CONTEXTMENU_START);
+
     // This runs the message loop, calling back to us with f.e. WM_INITPOPUP (hence why m_hContextMenu and m_pCM exist)
     uCommand = TrackPopupMenu(m_hContextMenu,
                               TPM_LEFTALIGN | TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON,
                               pt.x, pt.y, 0, m_hWnd, NULL);
-    if (uCommand == 0)
-        return 0;
-
     if (uCommand >= DVIDM_ARRANGESORT_FIRST && uCommand <= DVIDM_ARRANGESORT_LAST)
-        return SendMessage(WM_COMMAND, uCommand, 0);
+    {
+        SendMessage(WM_COMMAND, uCommand, 0);
+    }
+    else if (uCommand != 0 && !(uCommand == DVIDM_COMMDLG_SELECT && OnDefaultCommand() == S_OK))
+    {
+        InvokeContextMenuCommand(m_pCM, MAKEINTRESOURCEA(uCommand - CONTEXT_MENU_BASE_ID), &pt);
+    }
 
-    if (uCommand == FCIDM_SHVIEW_OPEN && OnDefaultCommand() == S_OK)
-        return 0;
-
-    InvokeContextMenuCommand(m_pCM, MAKEINTRESOURCEA(uCommand - CONTEXT_MENU_BASE_ID), &pt);
-
+    if (pcdb2)
+        pcdb2->Notify(static_cast<IShellView*>(this), CDB2N_CONTEXTMENU_DONE);
     return 0;
 }
 
@@ -2805,29 +2856,35 @@ LRESULT CDefView::OnChangeNotify(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &
     TRACE("(%p)(%p,%p,%p)\n", this, Pidls[0], Pidls[1], lParam);
 
     if (_DoFolderViewCB(SFVM_FSNOTIFY, (WPARAM)Pidls, lEvent) == S_FALSE)
+    {
+        SHChangeNotification_Unlock(hLock);
         return FALSE;
+    }
 
     // Translate child IDLs.
     // SHSimpleIDListFromPathW creates fake PIDLs (lacking some attributes)
+    lEvent &= ~SHCNE_INTERRUPT;
     HRESULT hr;
     PITEMID_CHILD child0 = NULL, child1 = NULL;
     CComHeapPtr<ITEMIDLIST_RELATIVE> pidl0Temp, pidl1Temp;
-    if (_ILIsSpecialFolder(Pidls[0]) || ILIsParentOrSpecialParent(m_pidlParent, Pidls[0]))
+    if (lEvent != SHCNE_UPDATEIMAGE && lEvent < SHCNE_EXTENDED_EVENT)
     {
-        child0 = ILFindLastID(Pidls[0]);
-        hr = SHGetRealIDL(m_pSFParent, child0, &pidl0Temp);
-        if (SUCCEEDED(hr))
-            child0 = pidl0Temp;
-    }
-    if (_ILIsSpecialFolder(Pidls[1]) || ILIsParentOrSpecialParent(m_pidlParent, Pidls[1]))
-    {
-        child1 = ILFindLastID(Pidls[1]);
-        hr = SHGetRealIDL(m_pSFParent, child1, &pidl1Temp);
-        if (SUCCEEDED(hr))
-            child1 = pidl1Temp;
+        if (_ILIsSpecialFolder(Pidls[0]) || ILIsParentOrSpecialParent(m_pidlParent, Pidls[0]))
+        {
+            child0 = ILFindLastID(Pidls[0]);
+            hr = SHGetRealIDL(m_pSFParent, child0, &pidl0Temp);
+            if (SUCCEEDED(hr))
+                child0 = pidl0Temp;
+        }
+        if (_ILIsSpecialFolder(Pidls[1]) || ILIsParentOrSpecialParent(m_pidlParent, Pidls[1]))
+        {
+            child1 = ILFindLastID(Pidls[1]);
+            hr = SHGetRealIDL(m_pSFParent, child1, &pidl1Temp);
+            if (SUCCEEDED(hr))
+                child1 = pidl1Temp;
+        }
     }
 
-    lEvent &= ~SHCNE_INTERRUPT;
     switch (lEvent)
     {
         case SHCNE_MKDIR:
@@ -3005,7 +3062,7 @@ HRESULT WINAPI CDefView::TranslateAccelerator(LPMSG lpmsg)
         TRACE("-- key=0x%04lx\n", lpmsg->wParam);
     }
 
-    return m_pShellBrowser->TranslateAcceleratorSB(lpmsg, 0);
+    return m_pShellBrowser ? m_pShellBrowser->TranslateAcceleratorSB(lpmsg, 0) : S_FALSE;
 }
 
 HRESULT WINAPI CDefView::EnableModeless(BOOL fEnable)
@@ -3240,7 +3297,7 @@ HRESULT CDefView::SaveViewState(IStream *pStream)
     lvc.mask = LVCF_WIDTH | LVCF_SUBITEM;
     for (UINT i = 0, j = 0; i < PERSISTCOLUMNS::MAXCOUNT && ListView_GetColumn(m_ListView, j, &lvc); ++j)
     {
-        HRESULT hr = MapListColumnToFolderColumn(lvc.iSubItem);
+        HRESULT hr = MapListColumnToFolderColumn(j);
         if (SUCCEEDED(hr))
         {
             cols.Columns[i] = MAKELONG(hr, lvc.cx);
@@ -3421,7 +3478,7 @@ HRESULT WINAPI CDefView::GetItemObject(UINT uItem, REFIID riid, LPVOID *ppvOut)
 FOLDERVIEWMODE CDefView::GetDefaultViewMode()
 {
     FOLDERVIEWMODE mode = ((m_FolderSettings.fFlags & FWF_DESKTOP) || !IsOS(OS_SERVERADMINUI)) ? FVM_ICON : FVM_DETAILS;
-    FOLDERVIEWMODE temp;
+    FOLDERVIEWMODE temp = mode;
     if (SUCCEEDED(_DoFolderViewCB(SFVM_DEFVIEWMODE, 0, (LPARAM)&temp)) && temp >= FVM_FIRST && temp <= FVM_LAST)
         mode = temp;
     return mode;
@@ -3710,6 +3767,7 @@ HRESULT STDMETHODCALLTYPE CDefView::CreateViewWindow3(IShellBrowser *psb, IShell
 
     /* Get our parent window */
     m_pShellBrowser->GetWindow(&m_hWndParent);
+    _DoFolderViewCB(SFVM_HWNDMAIN, 0, (LPARAM)m_hWndParent);
 
     /* Try to get the ICommDlgBrowserInterface, adds a reference !!! */
     m_pCommDlgBrowser = NULL;
@@ -3962,6 +4020,9 @@ HRESULT STDMETHODCALLTYPE CDefView::SetCallback(IShellFolderViewCB  *new_cb, ISh
         *old_cb = m_pShellFolderViewCB.Detach();
 
     m_pShellFolderViewCB = new_cb;
+    m_pFolderFilter = NULL;
+    if (new_cb)
+        new_cb->QueryInterface(IID_PPV_ARG(IFolderFilter, &m_pFolderFilter));
     return S_OK;
 }
 
@@ -4561,9 +4622,9 @@ HRESULT WINAPI CDefView::GetAdvise(DWORD *pAspects, DWORD *pAdvf, IAdviseSink **
 
 HRESULT STDMETHODCALLTYPE CDefView::QueryService(REFGUID guidService, REFIID riid, void **ppvObject)
 {
-    if (IsEqualIID(guidService, SID_IShellBrowser))
+    if (IsEqualIID(guidService, SID_IShellBrowser) && m_pShellBrowser)
         return m_pShellBrowser->QueryInterface(riid, ppvObject);
-    else if(IsEqualIID(guidService, SID_IFolderView))
+    else if (IsEqualIID(guidService, SID_IFolderView))
         return QueryInterface(riid, ppvObject);
 
     return E_NOINTERFACE;
@@ -4611,26 +4672,6 @@ HRESULT CDefView::_DoFolderViewCB(UINT uMsg, WPARAM wParam, LPARAM lParam)
 HRESULT CDefView_CreateInstance(IShellFolder *pFolder, REFIID riid, LPVOID * ppvOut)
 {
     return ShellObjectCreatorInit<CDefView>(pFolder, riid, ppvOut);
-}
-
-HRESULT WINAPI SHCreateShellFolderViewEx(
-    LPCSFV psvcbi,     // [in] shelltemplate struct
-    IShellView **ppsv) // [out] IShellView pointer
-{
-    CComPtr<IShellView> psv;
-    HRESULT hRes;
-
-    TRACE("sf=%p pidl=%p cb=%p mode=0x%08x parm=%p\n",
-      psvcbi->pshf, psvcbi->pidl, psvcbi->pfnCallback,
-      psvcbi->fvm, psvcbi->psvOuter);
-
-    *ppsv = NULL;
-    hRes = CDefView_CreateInstance(psvcbi->pshf, IID_PPV_ARG(IShellView, &psv));
-    if (FAILED_UNEXPECTEDLY(hRes))
-        return hRes;
-
-    *ppsv = psv.Detach();
-    return hRes;
 }
 
 HRESULT WINAPI SHCreateShellFolderView(const SFV_CREATE *pcsfv,
